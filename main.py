@@ -26,8 +26,9 @@ class MeshtasticManager:
 
     def check_internet_socket(self):
         try:
-            socket.setdefaulttimeout(0.8) # Super fast timeout
-            s = socket.create_connection(("1.1.1.1", 53), 0.8)
+            # Shortest timeout to detect internet status instantly
+            socket.setdefaulttimeout(0.5) 
+            s = socket.create_connection(("1.1.1.1", 53), 0.5)
             s.close()
             return True
         except:
@@ -35,8 +36,9 @@ class MeshtasticManager:
 
     async def monitor_internet(self):
         while True:
+            # Keep updating status in background every 5 seconds
             self.is_online = await asyncio.to_thread(self.check_internet_socket)
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
     def auto_connect(self):
         ports = serial.tools.list_ports.comports()
@@ -46,7 +48,6 @@ class MeshtasticManager:
                     return {"username": self.get_my_name(), "port": p.device}
                 try:
                     if self.interface: self.interface.close()
-                    # Initialize with no startup broadcast to save time
                     self.interface = meshtastic.serial_interface.SerialInterface(devPath=p.device)
                     pub.subscribe(self.on_receive, "meshtastic.receive")
                     self.current_port = p.device
@@ -84,24 +85,6 @@ async def startup_event():
     mesh.loop = asyncio.get_running_loop()
     asyncio.create_task(mesh.monitor_internet())
 
-@app.post("/send")
-async def send_message(text: str, background_tasks: BackgroundTasks, target: str = "^all"):
-    if not mesh.interface: return {"status": "error"}
-    
-    # In Short Fast, we fire and forget instantly
-    def fast_fire():
-        try:
-            mesh.interface.sendText(text, destinationId=target, wantAck=False, wantResponse=False)
-        except: pass
-
-    background_tasks.add_task(fast_fire)
-    
-    return {
-        "status": "sent", 
-        "mode": "Internet" if mesh.is_online else "LoRa",
-        "time": datetime.now().strftime("%H:%M:%S")
-    }
-
 @app.get("/status")
 def get_system_status():
     return {
@@ -116,13 +99,35 @@ def scan():
     res = mesh.auto_connect()
     return {"status": "success", **res} if res else {"status": "searching"}
 
+@app.post("/send")
+async def send_message(text: str, background_tasks: BackgroundTasks, target: str = "^all"):
+    if not mesh.interface: return {"status": "error"}
+    
+    # Priority: Don't wait for internet check result before firing LoRa
+    # This removes the 7-10s delay during mode switching
+    def instant_fire():
+        try:
+            # wantAck=False is CRITICAL for sub-2s speed
+            mesh.interface.sendText(text, destinationId=target, wantAck=False)
+        except: pass
+
+    background_tasks.add_task(instant_fire)
+    
+    return {
+        "status": "sent", 
+        "mode": "Internet" if mesh.is_online else "LoRa",
+        "time": datetime.now().strftime("%H:%M:%S")
+    }
+
 @app.get("/peers")
 def get_peers():
     if not mesh.interface: return []
     peers = []
     try:
+        my_id = mesh.interface.getMyNodeInfo().get('num')
+        my_hex = f"!{hex(my_id)[2:]}"
         for node_id, info in mesh.interface.nodes.items():
-            if 'user' in info:
+            if 'user' in info and info['user']['id'] != my_hex:
                 peers.append({"id": info['user']['id'], "name": info['user'].get('longName', 'Unknown')})
     except: pass
     return peers
