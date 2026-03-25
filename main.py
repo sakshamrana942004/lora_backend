@@ -5,7 +5,7 @@ import meshtastic.serial_interface
 from pubsub import pub
 import asyncio
 import socket
-import time
+from datetime import datetime
 
 app = FastAPI()
 
@@ -24,13 +24,10 @@ class MeshtasticManager:
         self.is_online = True
         self.loop = asyncio.get_event_loop()
 
-    # Sabse reliable internet check using socket
     def check_internet_socket(self):
         try:
-            # Connect to Cloudflare DNS (1.1.1.1) on port 53
-            socket.setdefaulttimeout(2)
-            host = socket.gethostbyname("1.1.1.1")
-            s = socket.create_connection((host, 53), 2)
+            socket.setdefaulttimeout(1.5) # Fast timeout
+            s = socket.create_connection(("1.1.1.1", 53), 1.5)
             s.close()
             return True
         except:
@@ -38,10 +35,9 @@ class MeshtasticManager:
 
     async def monitor_internet(self):
         while True:
-            # Running synchronous socket check in a thread to keep FastAPI fast
+            # Background check using thread to avoid blocking main loop
             self.is_online = await asyncio.to_thread(self.check_internet_socket)
-            print(f"DEBUG: Internet is {'ONLINE' if self.is_online else 'OFFLINE'}")
-            await asyncio.sleep(5) # Har 5 sec mein check karega
+            await asyncio.sleep(5) 
 
     def auto_connect(self):
         ports = serial.tools.list_ports.comports()
@@ -58,28 +54,26 @@ class MeshtasticManager:
                 except: continue
         return None
 
-    def get_radio_details(self):
-        return {"freq": "865.875 MHz", "power": "30 dBm"}
+    def on_receive(self, packet, interface):
+        if 'decoded' in packet and packet['decoded'].get('portnum') == 'TEXT_MESSAGE_APP':
+            # Adding timestamp on reception
+            now = datetime.now().strftime("%H:%M:%S")
+            data = {
+                "text": packet['decoded']['text'],
+                "sender": packet.get('fromId', 'Unknown'),
+                "via": "LoRa",
+                "time": now
+            }
+            for connection in self.active_connections:
+                self.loop.create_task(connection.send_json(data))
 
     def get_my_name(self):
         if not self.interface: return "Unknown"
         try:
             my_info = self.interface.getMyNodeInfo()
-            node_id = my_info.get('num')
-            user = self.interface.nodes.get(node_id, {}).get('user', {})
-            return user.get('longName') or f"Node-{hex(node_id)[2:]}"
+            user = self.interface.nodes.get(my_info.get('num', 0), {}).get('user', {})
+            return user.get('longName') or f"Node-{hex(my_info.get('num'))[2:]}"
         except: return "Syncing..."
-
-    def on_receive(self, packet, interface):
-        if 'decoded' in packet and packet['decoded'].get('portnum') == 'TEXT_MESSAGE_APP':
-            data = {
-                "text": packet['decoded']['text'],
-                "sender": packet.get('fromId', 'Unknown'),
-                "snr": packet.get('rxSnr', 'N/A'),
-                "via": "LoRa"
-            }
-            for connection in self.active_connections:
-                self.loop.create_task(connection.send_json(data))
 
 mesh = MeshtasticManager()
 
@@ -93,25 +87,28 @@ def get_system_status():
         "internet": mesh.is_online,
         "hardware": mesh.current_port,
         "username": mesh.get_my_name(),
-        "radio": mesh.get_radio_details()
+        "radio": {"freq": "865.875 MHz", "power": "30 dBm"}
     }
 
 @app.get("/auto-scan")
 def scan():
     res = mesh.auto_connect()
-    if res: return {"status": "success", **res}
-    return {"status": "searching"}
+    return {"status": "success", **res} if res else {"status": "searching"}
 
 @app.post("/send")
 async def send_message(text: str, target: str = "^all"):
-    if not mesh.interface: return {"status": "error", "message": "No Device"}
+    if not mesh.interface: return {"status": "error"}
     try:
+        # Optimistic Send: No wait for internet check
         mesh.interface.sendText(text, destinationId=target, wantAck=False)
-        return {"status": "sent", "mode": "Internet" if mesh.is_online else "LoRa"}
+        return {
+            "status": "sent", 
+            "mode": "Internet" if mesh.is_online else "LoRa",
+            "time": datetime.now().strftime("%H:%M:%S")
+        }
     except:
         mesh.interface = None
-        mesh.current_port = None
-        return {"status": "error", "message": "Disconnected"}
+        return {"status": "error"}
 
 @app.get("/peers")
 def get_peers():
@@ -133,6 +130,4 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True: await websocket.receive_text()
     except: pass
-    finally:
-        if websocket in mesh.active_connections:
-            mesh.active_connections.remove(websocket)
+    finally: mesh.active_connections.remove(websocket)
