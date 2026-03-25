@@ -6,7 +6,6 @@ from pubsub import pub
 import asyncio
 import socket
 from datetime import datetime
-import threading
 
 app = FastAPI()
 
@@ -23,12 +22,12 @@ class MeshtasticManager:
         self.active_connections = set()
         self.current_port = None
         self.is_online = True
-        self.loop = None # Will be set on startup
+        self.loop = None
 
     def check_internet_socket(self):
         try:
-            socket.setdefaulttimeout(1)
-            s = socket.create_connection(("1.1.1.1", 53), 1)
+            socket.setdefaulttimeout(0.8) # Super fast timeout
+            s = socket.create_connection(("1.1.1.1", 53), 0.8)
             s.close()
             return True
         except:
@@ -36,9 +35,8 @@ class MeshtasticManager:
 
     async def monitor_internet(self):
         while True:
-            # Non-blocking check
             self.is_online = await asyncio.to_thread(self.check_internet_socket)
-            await asyncio.sleep(10) 
+            await asyncio.sleep(10)
 
     def auto_connect(self):
         ports = serial.tools.list_ports.comports()
@@ -47,11 +45,8 @@ class MeshtasticManager:
                 if self.current_port == p.device and self.interface:
                     return {"username": self.get_my_name(), "port": p.device}
                 try:
-                    # Clean up old connection
-                    if self.interface: 
-                        self.interface.close()
-                    
-                    # Connect with a dedicated thread for pubsub
+                    if self.interface: self.interface.close()
+                    # Initialize with no startup broadcast to save time
                     self.interface = meshtastic.serial_interface.SerialInterface(devPath=p.device)
                     pub.subscribe(self.on_receive, "meshtastic.receive")
                     self.current_port = p.device
@@ -68,7 +63,6 @@ class MeshtasticManager:
                 "via": "LoRa",
                 "time": now
             }
-            # Push to all active WS clients
             if self.loop:
                 for connection in list(self.active_connections):
                     self.loop.call_soon_threadsafe(
@@ -90,34 +84,17 @@ async def startup_event():
     mesh.loop = asyncio.get_running_loop()
     asyncio.create_task(mesh.monitor_internet())
 
-@app.get("/status")
-def get_system_status():
-    return {
-        "internet": mesh.is_online,
-        "hardware": mesh.current_port,
-        "username": mesh.get_my_name(),
-        "radio": {"freq": "865.875 MHz", "power": "30 dBm"}
-    }
-
-@app.get("/auto-scan")
-def scan():
-    res = mesh.auto_connect()
-    return {"status": "success", **res} if res else {"status": "searching"}
-
-# ASYNC SENDING TO REMOVE 7SEC DELAY
-def async_send_lora(text, target):
-    try:
-        if mesh.interface:
-            mesh.interface.sendText(text, destinationId=target, wantAck=False)
-    except:
-        mesh.interface = None
-
 @app.post("/send")
 async def send_message(text: str, background_tasks: BackgroundTasks, target: str = "^all"):
     if not mesh.interface: return {"status": "error"}
     
-    # Task ko background mein daal do, wait mat karo
-    background_tasks.add_task(async_send_lora, text, target)
+    # In Short Fast, we fire and forget instantly
+    def fast_fire():
+        try:
+            mesh.interface.sendText(text, destinationId=target, wantAck=False, wantResponse=False)
+        except: pass
+
+    background_tasks.add_task(fast_fire)
     
     return {
         "status": "sent", 
@@ -125,15 +102,27 @@ async def send_message(text: str, background_tasks: BackgroundTasks, target: str
         "time": datetime.now().strftime("%H:%M:%S")
     }
 
+@app.get("/status")
+def get_system_status():
+    return {
+        "internet": mesh.is_online,
+        "hardware": mesh.current_port,
+        "username": mesh.get_my_name(),
+        "radio": {"freq": "865.875 MHz", "power": "30 dBm", "preset": "ShortFast"}
+    }
+
+@app.get("/auto-scan")
+def scan():
+    res = mesh.auto_connect()
+    return {"status": "success", **res} if res else {"status": "searching"}
+
 @app.get("/peers")
 def get_peers():
     if not mesh.interface: return []
     peers = []
     try:
-        my_id = mesh.interface.getMyNodeInfo().get('num')
-        my_hex = f"!{hex(my_id)[2:]}"
         for node_id, info in mesh.interface.nodes.items():
-            if 'user' in info and info['user']['id'] != my_hex:
+            if 'user' in info:
                 peers.append({"id": info['user']['id'], "name": info['user'].get('longName', 'Unknown')})
     except: pass
     return peers
@@ -144,5 +133,5 @@ async def websocket_endpoint(websocket: WebSocket):
     mesh.active_connections.add(websocket)
     try:
         while True: await websocket.receive_text()
-    except WebSocketDisconnect:
-        mesh.active_connections.remove(websocket)
+    except: pass
+    finally: mesh.active_connections.remove(websocket)
